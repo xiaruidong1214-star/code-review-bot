@@ -197,6 +197,22 @@ v1 的注释写着"流式读取请求体"，代码却是 `body = await request.b
 
 ---
 
+## 相关项目
+
+本仓库原名与另一套系统混装在同一个仓库里（根目录的 `tracker.py` / `tasks.py` / `report.py` 属于 LLM 调用成本治理，
+与代码审查毫无关系，而且两套代码各自使用互不相干的 Redis 配置）。
+
+现在它们已经彻底分离，各自独立可运行、独立测试、独立发布：
+
+| 项目 | 职责 |
+|---|---|
+| **code-review-bot**（本仓库） | 代码审查：AST 结构统计、调用图递归检测、规则化代码味道、LLM 改进建议 |
+| [llm-cost-governor](https://github.com/xiaruidong1214-star/llm-cost-governor) | LLM 调用成本治理：按百万 token 的分时段定价、分位数与 MAD 离群检测、无效重试识别 |
+
+两者之间**没有任何代码依赖**。拆分的原因、以及分离过程中顺带修掉的具体缺陷，见 [SPLIT-NOTES.md](SPLIT-NOTES.md)。
+
+---
+
 ## 已知限制
 
 **这一节是刻意保留的。** 一个只有优点的 README 不可信，而下面这些是我明确知道还没做好的部分：

@@ -5,6 +5,14 @@ v1 的三个问题在这里被修掉：
 2. 写了 ``acquire_lock`` 但**从未调用** → 这里真正接进提交路径；
 3. ``release_lock`` 是裸 ``DELETE`` → 改为 token 校验 + Lua 原子释放，
    否则锁 TTL 到期后可能误删其他 worker 持有的锁。
+
+本模块提供**两个**实现，刻意共享 key 结构与 Lua 脚本：
+
+* :class:`AsyncCacheStore` —— 给 API/流水线用（``redis.asyncio``）。
+  流水线跑在事件循环里，同步客户端每次调用都会**阻塞事件循环**，
+  一次网络往返期间整个进程停摆，高并发下吞吐会退化成近似串行。
+* :class:`CacheStore` —— 给 Celery worker 用（同步客户端）。
+  worker 进程里没有事件循环要保护，用同步版更简单直接。
 """
 
 from __future__ import annotations
@@ -15,10 +23,14 @@ import uuid
 from typing import Any
 
 import redis
+import redis.asyncio as redis_async
 
 from reviewbot.logging_setup import get_logger
 
 logger = get_logger(__name__)
+
+#: `redis.asyncio.Redis` 的最小类型别名，便于测试注入替身
+AsyncRedis = redis_async.Redis
 
 CACHE_PREFIX = "crb:cache"
 LOCK_PREFIX = "crb:lock"
@@ -43,6 +55,79 @@ def build_cache_key(*, language: str, normalized_fingerprint: str, analyzer_vers
     raw = "|".join([language, normalized_fingerprint, analyzer_version, model])
     digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()
     return f"{CACHE_PREFIX}:{digest}"
+
+
+class AsyncCacheStore:
+    """`redis.asyncio` 版本的缓存与锁。
+
+    **为什么需要它**：流水线跑在事件循环里，而同步 Redis 客户端每次调用都会阻塞
+    事件循环——一次 `GET` 在网络往返期间会让整个进程停止处理其他请求。
+    高并发下这会把吞吐压到接近"串行"。
+
+    与同步版共享同一套 key 结构与同一段 Lua 释放脚本（见模块顶部的
+    :func:`build_cache_key` 与 :data:`_RELEASE_LUA`），避免两套实现慢慢漂移。
+    """
+
+    def __init__(self, client: AsyncRedis, ttl_seconds: int = 3600, lock_ttl_seconds: int = 45) -> None:
+        self.client = client
+        self.ttl = ttl_seconds
+        self.lock_ttl = lock_ttl_seconds
+
+    async def get(self, key: str) -> dict[str, Any] | None:
+        try:
+            raw = await self.client.get(key)
+        except Exception:  # noqa: BLE001 - 缓存不可用时降级为未命中
+            logger.warning("cache_get_failed", key=key, exc_info=True)
+            return None
+        if raw is None:
+            return None
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            logger.warning("cache_value_corrupted", key=key)
+            await self.client.delete(key)
+            return None
+
+    async def set(self, key: str, value: dict[str, Any]) -> bool:
+        try:
+            await self.client.setex(key, self.ttl, json.dumps(value, ensure_ascii=False))
+            return True
+        except Exception:  # noqa: BLE001 - 写缓存失败不应让主流程失败
+            logger.warning("cache_set_failed", key=key, exc_info=True)
+            return False
+
+    async def acquire_lock(self, key: str) -> str | None:
+        token = uuid.uuid4().hex
+        try:
+            acquired = await self.client.set(f"{LOCK_PREFIX}:{key}", token, nx=True, ex=self.lock_ttl)
+        except Exception:  # noqa: BLE001
+            logger.warning("lock_acquire_failed", key=key, exc_info=True)
+            return None
+        return token if acquired else None
+
+    async def release_lock(self, key: str, token: str) -> bool:
+        try:
+            released = await self.client.eval(_RELEASE_LUA, 1, f"{LOCK_PREFIX}:{key}", token)
+            return bool(released)
+        except Exception:  # noqa: BLE001
+            logger.warning("lock_release_failed", key=key, exc_info=True)
+            return False
+
+    async def put_progress(self, task_id: str, payload: dict[str, Any], ttl_seconds: int) -> None:
+        try:
+            await self.client.setex(
+                f"{RESULT_PREFIX}:{task_id}", ttl_seconds, json.dumps(payload, ensure_ascii=False)
+            )
+        except Exception:  # noqa: BLE001
+            logger.warning("progress_write_failed", task_id=task_id, exc_info=True)
+
+    async def get_progress(self, task_id: str) -> dict[str, Any] | None:
+        try:
+            raw = await self.client.get(f"{RESULT_PREFIX}:{task_id}")
+        except Exception:  # noqa: BLE001
+            logger.warning("progress_read_failed", task_id=task_id, exc_info=True)
+            return None
+        return json.loads(raw) if raw else None
 
 
 class CacheStore:

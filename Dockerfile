@@ -20,7 +20,12 @@ ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH" \
     CRB_DB_PATH=/data/reviews.db \
-    CRB_LOG_JSON=true
+    CRB_LOG_JSON=true \
+    CRB_HOST=0.0.0.0
+
+# 上面显式把容器内监听设为 0.0.0.0（否则容器外无法访问）。
+# 注意：容器内 0.0.0.0 是否等于"对外暴露"取决于端口映射与网络；
+# 若把 8000 映射到公网，请务必同时设置 CRB_API_KEY，见 README「安全」一节。
 
 # 以非 root 运行；/data 用于 SQLite 持久化
 RUN useradd --create-home --uid 10001 appuser \

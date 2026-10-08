@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from typing import Any
 
 from reviewbot.analysis import analyze_python, normalize_source
-from reviewbot.cache import CacheStore, build_cache_key
+from reviewbot.cache import AsyncCacheStore, build_cache_key
 from reviewbot.github_source import GitHubFetcher, GitHubFetchError
 from reviewbot.llm import LLMClient
 from reviewbot.logging_setup import get_logger
@@ -43,6 +43,20 @@ class LLMOutcome:
     degraded: bool = False
     error: str | None = None
     total_tokens: int = 0
+
+
+@dataclass(slots=True)
+class Submission:
+    """提交阶段的产物。
+
+    ``fingerprint`` 一并返回，是为了让 :meth:`ReviewPipeline.run` 复用已算好的
+    AST 指纹，避免对同一段代码重复 ``ast.parse``（大文件上这是可观的 CPU 开销）。
+    """
+
+    task_id: str
+    source_type: str
+    cache_hit: bool
+    fingerprint: str | None = None
 
 
 @dataclass(slots=True)
@@ -77,7 +91,7 @@ class ReviewPipeline:
         *,
         settings,
         store: ReviewStore,
-        cache: CacheStore,
+        cache: AsyncCacheStore,
         llm: LLMClient,
         github: GitHubFetcher,
     ) -> None:
@@ -88,17 +102,21 @@ class ReviewPipeline:
         self.github = github
 
     # ---------------- 提交 ----------------
-    def submit(self, *, code: str | None, github_url: str | None, language: str) -> tuple[str, str, bool]:
-        """创建任务记录并立即返回（不阻塞请求）。
+    async def submit(
+        self, *, code: str | None, github_url: str | None, language: str
+    ) -> Submission:
+        """创建任务记录、查一次缓存，并返回后续执行所需的一切。
 
-        返回 ``(task_id, source_type, cache_hit)``。命中缓存时结果已经可直接读取。
+        返回 :class:`Submission`。把 ``fingerprint`` 一并带出来是刻意的：
+        ``run()`` 需要它来算缓存 key，而在 ``submit()`` 里已经算过一次，
+        返回它就能避免对同一段代码重复解析 AST。
         """
         task_id = str(uuid.uuid4())
         source_type = "code" if code else "github"
 
         if github_url:
             self.store.create(task_id, language, github_url, source_type)
-            return task_id, source_type, False
+            return Submission(task_id=task_id, source_type=source_type, cache_hit=False)
 
         assert code is not None
         self.store.create(task_id, language, code, source_type)
@@ -106,7 +124,7 @@ class ReviewPipeline:
         fingerprint = normalize_source(code)
         if fingerprint is None:
             # 语法错误的代码不缓存：无论如何重试都只会得到同一个解析错误
-            return task_id, source_type, False
+            return Submission(task_id=task_id, source_type=source_type, cache_hit=False)
 
         cache_key = build_cache_key(
             language=language,
@@ -114,7 +132,7 @@ class ReviewPipeline:
             analyzer_version=ANALYZER_VERSION,
             model=self.llm.model,
         )
-        cached = self.cache.get(cache_key)
+        cached = await self.cache.get(cache_key)
         if cached is not None:
             logger.info("cache_hit", task_id=task_id)
             stored = dict(cached)
@@ -126,9 +144,13 @@ class ReviewPipeline:
                 cache_hit=True,
                 llm_degraded=bool((stored.get("llm") or {}).get("degraded")),
             )
-            return task_id, source_type, True
+            return Submission(
+                task_id=task_id, source_type=source_type, cache_hit=True, fingerprint=fingerprint
+            )
 
-        return task_id, source_type, False
+        return Submission(
+            task_id=task_id, source_type=source_type, cache_hit=False, fingerprint=fingerprint
+        )
 
     # ---------------- 执行 ----------------
     async def run(
@@ -139,7 +161,16 @@ class ReviewPipeline:
         github_url: str | None = None,
         language: str = "python",
         on_progress: ProgressCallback | None = None,
+        fingerprint: str | None = None,
     ) -> PipelineResult:
+        """执行一次审查。
+
+        :param fingerprint: 可选的 AST 指纹。``submit()`` 已经算过一次，
+            这里直接复用，避免对同一段代码重复解析两次 AST
+            （``ast.parse`` 在大文件上是可观的 CPU 开销）。
+            从 GitHub 抓取的代码没有指纹，传 ``None`` 由本方法自行计算。
+        """
+
         async def report(progress: int, step: str) -> None:
             if on_progress is not None:
                 await on_progress(progress, step)
@@ -151,11 +182,12 @@ class ReviewPipeline:
             if not code:
                 raise ValueError("没有可供分析的代码")
 
-            cache_key = self._cache_key(code, language)
-            fingerprint = normalize_source(code)
+            if fingerprint is None:
+                fingerprint = normalize_source(code)
+            cache_key = self._cache_key_from_fingerprint(fingerprint, language)
 
             # 1) 缓存已在上游 submit 查过，这里再查一次以覆盖「等待期间他人已写入」的情况
-            cached = self.cache.get(cache_key) if cache_key else None
+            cached = await self.cache.get(cache_key) if cache_key else None
             if cached is not None:
                 await report(100, "命中缓存")
                 result = PipelineResult(
@@ -165,8 +197,8 @@ class ReviewPipeline:
                 return result
 
             # 2) 抢锁；抢不到就等别人算完（singleflight）
-            if cache_key and fingerprint is not None:
-                token = self.cache.acquire_lock(cache_key)
+            if cache_key:
+                token = await self.cache.acquire_lock(cache_key)
                 if token is None:
                     await report(20, "同类请求正在分析，等待结果")
                     waited = await self._wait_for_cache(cache_key)
@@ -177,20 +209,20 @@ class ReviewPipeline:
                         self._persist(task_id, result)
                         return result
                     logger.info("singleflight_timeout", task_id=task_id)
-                    token = self.cache.acquire_lock(cache_key)
+                    token = await self.cache.acquire_lock(cache_key)
 
                 try:
                     result = await self._analyze(task_id, code, language, report)
                 finally:
                     if token is not None:
                         # 只在锁仍属于自己时释放，避免误删他人的锁
-                        self.cache.release_lock(cache_key, token)
+                        await self.cache.release_lock(cache_key, token)
             else:
                 result = await self._analyze(task_id, code, language, report)
 
             # 3) 写缓存：让等待者与后续重复请求直接命中
-            if cache_key and fingerprint is not None:
-                self.cache.set(cache_key, result.to_dict())
+            if cache_key:
+                await self.cache.set(cache_key, result.to_dict())
 
             await report(100, "完成")
             self._persist(task_id, result)
@@ -208,8 +240,7 @@ class ReviewPipeline:
             raise
 
     # ---------------- 内部 ----------------
-    def _cache_key(self, code: str, language: str) -> str | None:
-        fingerprint = normalize_source(code)
+    def _cache_key_from_fingerprint(self, fingerprint: str | None, language: str) -> str | None:
         if fingerprint is None:
             return None
         return build_cache_key(
@@ -224,7 +255,7 @@ class ReviewPipeline:
         deadline = time.monotonic() + self.settings.singleflight_wait_seconds
         while time.monotonic() < deadline:
             await asyncio.sleep(0.2)
-            found = self.cache.get(cache_key)
+            found = await self.cache.get(cache_key)
             if found is not None:
                 logger.info("singleflight_satisfied")
                 return found

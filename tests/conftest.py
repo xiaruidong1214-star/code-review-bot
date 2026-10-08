@@ -9,7 +9,7 @@ from typing import Any
 
 import pytest
 
-from reviewbot.cache import CacheStore
+from reviewbot.cache import AsyncCacheStore
 from reviewbot.llm import LLMClient
 from reviewbot.settings import Settings
 
@@ -89,6 +89,48 @@ class FakeRedis:
         return 0
 
 
+class AsyncFakeRedis:
+    """把 :class:`FakeRedis` 包成异步接口。
+
+    **刻意只做委托，不重新实现语义**：所有真实逻辑（TTL、`SET NX`、
+    释放锁的 Lua 脚本）都仍然跑在被同步测试覆盖过的 ``FakeRedis`` 上。
+    这样异步路径的测试不会引入"第三套语义实现"，也就不会出现
+    "两个替身各自漂移"的隐患——这正是真实 Redis 那一档在防的问题。
+    """
+
+    def __init__(self) -> None:
+        self._inner = FakeRedis()
+
+    # 暴露内部以复用测试里的断言工具（如 fake_redis.values / expiry）
+    @property
+    def inner(self) -> FakeRedis:
+        return self._inner
+
+    async def get(self, key: str):
+        return self._inner.get(key)
+
+    async def set(self, key: str, value, nx: bool = False, ex: int | None = None):
+        return self._inner.set(key, value, nx=nx, ex=ex)
+
+    async def setex(self, key: str, ttl: int, value):
+        return self._inner.setex(key, ttl, value)
+
+    async def delete(self, *keys: str):
+        return self._inner.delete(*keys)
+
+    async def keys(self, pattern: str = "*"):
+        return self._inner.keys(pattern)
+
+    async def ping(self):
+        return self._inner.ping()
+
+    async def aclose(self):
+        return None
+
+    async def eval(self, script: str, numkeys: int, *args):
+        return self._inner.eval(script, numkeys, *args)
+
+
 class FakeTransport:
     """httpx MockTransport 的包装，按 URL 片段分发响应。"""
 
@@ -116,12 +158,20 @@ class FakeTransport:
 
 @pytest.fixture
 def fake_redis() -> FakeRedis:
+    """同步替身（给 Celery / 健康检查这类同步路径用）。"""
     return FakeRedis()
 
 
 @pytest.fixture
-def cache(fake_redis: FakeRedis) -> CacheStore:
-    return CacheStore(fake_redis, ttl_seconds=60, lock_ttl_seconds=5)
+def async_fake_redis() -> AsyncFakeRedis:
+    """异步替身（给流水线与 API 用）。"""
+    return AsyncFakeRedis()
+
+
+@pytest.fixture
+def cache(async_fake_redis: AsyncFakeRedis) -> AsyncCacheStore:
+    """流水线使用的缓存（异步版）。"""
+    return AsyncCacheStore(async_fake_redis, ttl_seconds=60, lock_ttl_seconds=5)
 
 
 @pytest.fixture

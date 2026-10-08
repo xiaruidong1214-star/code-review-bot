@@ -17,7 +17,7 @@ import uuid
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 
-from fastapi import APIRouter, FastAPI, HTTPException, Request, Response
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import StreamingResponse
 
 from reviewbot import __version__
@@ -32,6 +32,7 @@ from reviewbot.schemas import (
     TaskResult,
     TaskState,
 )
+from reviewbot.security import require_api_key, warn_if_exposed
 from reviewbot.settings import get_settings
 
 logger = get_logger(__name__)
@@ -59,6 +60,7 @@ def build_app(container: Container | None = None) -> FastAPI:
     async def lifespan(app: FastAPI):
         app.state.container = container or Container()
         app.state.background_tasks = set()
+        warn_if_exposed(app.state.container.settings)
         logger.info("app_started", version=__version__, env=settings.env)
         try:
             yield
@@ -95,17 +97,20 @@ def build_app(container: Container | None = None) -> FastAPI:
     return app
 
 
-def _pipeline(request: Request):
-    return request.app.state.container.pipeline
-
-
-async def _execute(request: Request, task_id: str, code: str | None, github_url: str | None, language: str) -> None:
+async def _execute(
+    request: Request,
+    task_id: str,
+    code: str | None,
+    github_url: str | None,
+    language: str,
+    fingerprint: str | None = None,
+) -> None:
     """后台执行流水线。Celery 未启用时在进程内跑；异常已在流水线内落库。"""
-    pipeline = _pipeline(request)
     container: Container = request.app.state.container
+    pipeline = container.pipeline
 
     async def on_progress(progress: int, step: str) -> None:
-        container.cache.put_progress(
+        await container.cache.put_progress(
             task_id,
             {"task_id": task_id, "state": TaskState.PROCESSING, "progress": progress, "step": step},
             container.settings.result_ttl_seconds,
@@ -118,9 +123,11 @@ async def _execute(request: Request, task_id: str, code: str | None, github_url:
             github_url=github_url,
             language=language,
             on_progress=on_progress,
+            # 复用 submit 阶段已经算好的 AST 指纹，避免对同一段代码解析两次
+            fingerprint=fingerprint,
         )
     except asyncio.CancelledError:
-        container.cache.put_progress(
+        await container.cache.put_progress(
             task_id,
             {"task_id": task_id, "state": TaskState.FAILED, "progress": 0, "step": "已取消"},
             container.settings.result_ttl_seconds,
@@ -128,7 +135,7 @@ async def _execute(request: Request, task_id: str, code: str | None, github_url:
         raise
     except Exception:  # noqa: BLE001 - 已落库，这里只补一条可读的进度记录
         stored = container.store.get(task_id)
-        container.cache.put_progress(
+        await container.cache.put_progress(
             task_id,
             {
                 "task_id": task_id,
@@ -141,7 +148,9 @@ async def _execute(request: Request, task_id: str, code: str | None, github_url:
         )
 
 
-def _submit(request: Request, *, code: str | None, github_url: str | None, language: str) -> ReviewAccepted:
+async def _submit(
+    request: Request, *, code: str | None, github_url: str | None, language: str
+) -> ReviewAccepted:
     container: Container = request.app.state.container
     limit = container.settings.rate_limit_per_minute
     _check_rate_limit(request, limit)
@@ -151,29 +160,45 @@ def _submit(request: Request, *, code: str | None, github_url: str | None, langu
 
     pipeline = container.pipeline
     try:
-        task_id, source_type, cache_hit = pipeline.submit(
-            code=code, github_url=github_url, language=language
-        )
+        submission = await pipeline.submit(code=code, github_url=github_url, language=language)
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    if not cache_hit:
-        task = asyncio.create_task(_execute(request, task_id, code, github_url, language))
+    if not submission.cache_hit:
+        task = asyncio.create_task(
+            _execute(
+                request,
+                submission.task_id,
+                code,
+                github_url,
+                language,
+                # 复用提交阶段算好的指纹，避免流水线里重复解析 AST
+                submission.fingerprint,
+            )
+        )
         request.app.state.background_tasks.add(task)
         task.add_done_callback(request.app.state.background_tasks.discard)
 
     return ReviewAccepted(
-        task_id=task_id,
-        status=TaskState.SUCCESS if cache_hit else TaskState.PENDING,
-        source_type=source_type,
-        message="命中缓存，结果可直接查询" if cache_hit else "任务已提交，可通过 /v1/tasks/{task_id} 查询进度",
-        cache_hit=cache_hit,
+        task_id=submission.task_id,
+        status=TaskState.SUCCESS if submission.cache_hit else TaskState.PENDING,
+        source_type=submission.source_type,
+        message="命中缓存，结果可直接查询"
+        if submission.cache_hit
+        else "任务已提交，可通过 /v1/tasks/{task_id} 查询进度",
+        cache_hit=submission.cache_hit,
     )
 
 
-@router.post("/reviews", response_model=ReviewAccepted, status_code=202, summary="提交代码审查")
+@router.post(
+    "/reviews",
+    response_model=ReviewAccepted,
+    status_code=202,
+    summary="提交代码审查",
+    dependencies=[Depends(require_api_key)],
+)
 async def submit_review(payload: ReviewRequest, request: Request) -> ReviewAccepted:
-    return _submit(
+    return await _submit(
         request,
         code=payload.code,
         github_url=str(payload.github_url) if payload.github_url else None,
@@ -181,7 +206,13 @@ async def submit_review(payload: ReviewRequest, request: Request) -> ReviewAccep
     )
 
 
-@router.post("/reviews/stream", response_model=ReviewAccepted, status_code=202, summary="流式上传大段代码")
+@router.post(
+    "/reviews/stream",
+    response_model=ReviewAccepted,
+    status_code=202,
+    summary="流式上传大段代码",
+    dependencies=[Depends(require_api_key)],
+)
 async def submit_review_stream(request: Request, language: str = "python") -> ReviewAccepted:
     """真正的流式读取：边收边判上限，超限立刻中断，不把请求体整体读进内存。"""
     container: Container = request.app.state.container
@@ -205,10 +236,15 @@ async def submit_review_stream(request: Request, language: str = "python") -> Re
     except UnicodeDecodeError as exc:
         raise HTTPException(status_code=400, detail="请求体不是合法 UTF-8") from exc
 
-    return _submit(request, code=code, github_url=None, language=language)
+    return await _submit(request, code=code, github_url=None, language=language)
 
 
-@router.get("/tasks/{task_id}", response_model=TaskResult, summary="查询任务状态")
+@router.get(
+    "/tasks/{task_id}",
+    response_model=TaskResult,
+    summary="查询任务状态",
+    dependencies=[Depends(require_api_key)],
+)
 async def get_task(task_id: str, request: Request) -> TaskResult:
     container: Container = request.app.state.container
 
@@ -216,7 +252,7 @@ async def get_task(task_id: str, request: Request) -> TaskResult:
     if stored is None:
         raise HTTPException(status_code=404, detail="任务不存在")
 
-    progress = container.cache.get_progress(task_id) or {}
+    progress = await container.cache.get_progress(task_id) or {}
 
     if stored.state == TaskState.FAILED.value:
         return TaskResult(
@@ -246,7 +282,11 @@ async def get_task(task_id: str, request: Request) -> TaskResult:
     )
 
 
-@router.get("/tasks/{task_id}/events", summary="SSE 推送任务进度")
+@router.get(
+    "/tasks/{task_id}/events",
+    summary="SSE 推送任务进度",
+    dependencies=[Depends(require_api_key)],
+)
 async def stream_task_events(task_id: str, request: Request) -> StreamingResponse:
     container: Container = request.app.state.container
     if container.store.get(task_id) is None:
@@ -258,7 +298,7 @@ async def stream_task_events(task_id: str, request: Request) -> StreamingRespons
             if await request.is_disconnected():
                 break
             stored = container.store.get(task_id)
-            progress = container.cache.get_progress(task_id) or {}
+            progress = await container.cache.get_progress(task_id) or {}
             payload = {
                 "task_id": task_id,
                 "state": stored.state if stored else "UNKNOWN",
@@ -275,14 +315,24 @@ async def stream_task_events(task_id: str, request: Request) -> StreamingRespons
     return StreamingResponse(event_source(), media_type="text/event-stream")
 
 
-@router.get("/history", response_model=list[HistoryItem], summary="历史记录")
+@router.get(
+    "/history",
+    response_model=list[HistoryItem],
+    summary="历史记录",
+    dependencies=[Depends(require_api_key)],
+)
 async def get_history(request: Request, limit: int = 20, offset: int = 0) -> list[HistoryItem]:
     limit = max(1, min(limit, 100))
     container: Container = request.app.state.container
     return [HistoryItem(**item) for item in container.store.history(limit, offset)]
 
 
-@router.get("/stats", response_model=Stats, summary="统计信息")
+@router.get(
+    "/stats",
+    response_model=Stats,
+    summary="统计信息",
+    dependencies=[Depends(require_api_key)],
+)
 async def get_stats(request: Request) -> Stats:
     return Stats(**request.app.state.container.store.stats())
 

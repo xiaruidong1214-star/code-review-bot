@@ -4,7 +4,7 @@
 
 [![CI](https://github.com/xiaruidong1214-star/code-review-bot/actions/workflows/ci.yml/badge.svg)](https://github.com/xiaruidong1214-star/code-review-bot/actions/workflows/ci.yml)
 ![Python](https://img.shields.io/badge/python-3.11%20%7C%203.12-blue)
-![Tests](https://img.shields.io/badge/tests-119%20passed-brightgreen)
+![Tests](https://img.shields.io/badge/tests-144%20passed-brightgreen)
 ![License](https://img.shields.io/badge/license-MIT-green)
 
 ---
@@ -210,6 +210,68 @@ v1 的注释写着"流式读取请求体"，代码却是 `body = await request.b
 | [llm-cost-governor](https://github.com/xiaruidong1214-star/llm-cost-governor) | LLM 调用成本治理：按百万 token 的分时段定价、分位数与 MAD 离群检测、无效重试识别 |
 
 两者之间**没有任何代码依赖**。拆分的原因、以及分离过程中顺带修掉的具体缺陷，见 [SPLIT-NOTES.md](SPLIT-NOTES.md)。
+
+---
+
+## 安全
+
+**这个服务背后挂着按量计费的 LLM**，并且能读写 SQLite、能对外发起 GitHub 抓取。
+所以"谁能访问它"是一个会直接造成损失的问题，不是可选项。
+
+### 默认配置是安全的
+
+| 配置 | 默认值 | 含义 |
+|---|---|---|
+| `CRB_HOST` | `127.0.0.1` | **只监听回环**，同机之外访问不到 |
+| `CRB_API_KEY` | 空 | 不校验（本机自用） |
+
+两者叠加的效果是：默认状态下只有本机能用，不存在被白嫖额度的风险。
+
+### 暴露到公网前必须做的事
+
+```bash
+export CRB_HOST=0.0.0.0
+export CRB_API_KEY=$(python -c "import secrets; print(secrets.token_urlsafe(32))")
+```
+
+设置 `CRB_API_KEY` 后，**所有业务端点**都要求请求头：
+
+```
+X-API-Key: <你的 key>
+```
+
+未带 key → `401`；key 不匹配 → `403`。key 比较使用
+`hmac.compare_digest`（常量时间），避免时序侧信道。
+
+**健康检查端点 `/v1/health` 与 `/v1/livez` 刻意不校验** ——
+编排系统的探针不该需要先拿到密钥才能判断进程是否活着。
+
+### 危险组合会被告警
+
+如果监听非回环地址却**没有**设置 `CRB_API_KEY`，启动日志会打印一条
+`insecure_exposure` 警告。之所以只告警不拒绝启动：有些部署把鉴权放在
+反向代理层（nginx / API 网关），强行拒绝会挡掉这种合法用法。
+
+```json
+{"event":"insecure_exposure","host":"0.0.0.0","level":"warning",
+ "hint":"正在监听非回环地址且未设置 CRB_API_KEY：任何可达该端口的人都能使用你的 LLM 额度。"}
+```
+
+### 用 docker compose 时的注意事项
+
+`Dockerfile` 里把容器内监听显式设为 `0.0.0.0`（否则容器外访问不到），
+所以**端口映射决定了它有多暴露**：
+
+* `docker-compose.yml` 默认是 `127.0.0.1:8000:8000` → **只映射到宿主回环**，安全。
+  需要对外提供服务时改成 `8000:8000`，并**务必同时设置 `CRB_API_KEY`**。
+* 建议在前面放一个反向代理并做 TLS 与鉴权。
+
+### 还有哪些没有做
+
+* **没有内置用户体系 / 配额**：只有一个共享 key。多租户场景需要引入鉴权中间件与配额表。
+* **限流是进程内的**（见「已知限制」）：多副本部署时每个副本各算一份配额，
+  真正的限流应放在网关层。
+* 没有审计日志的持久化：鉴权失败只写结构化日志，未落库。
 
 ---
 

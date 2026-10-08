@@ -8,8 +8,9 @@
 from __future__ import annotations
 
 import redis
+import redis.asyncio as redis_async
 
-from reviewbot.cache import CacheStore
+from reviewbot.cache import AsyncCacheStore
 from reviewbot.github_source import GitHubFetcher
 from reviewbot.llm import LLMClient
 from reviewbot.logging_setup import configure_logging, get_logger
@@ -27,9 +28,13 @@ class Container:
         self.settings = settings or get_settings()
         configure_logging(self.settings.log_level, self.settings.log_json)
 
+        # 同步客户端：给 Celery worker 与健康检查这类同步调用用
         self.redis = redis.from_url(self.settings.redis_url, decode_responses=True)
-        self.cache = CacheStore(
-            self.redis,
+        # 异步客户端：给流水线用。**必须**用异步版，否则每次缓存读写都会
+        # 阻塞事件循环（见 reviewbot/cache.py 顶部的说明）。
+        self.async_redis = redis_async.from_url(self.settings.redis_url, decode_responses=True)
+        self.cache = AsyncCacheStore(
+            self.async_redis,
             ttl_seconds=self.settings.cache_ttl_seconds,
             lock_ttl_seconds=self.settings.lock_ttl_seconds,
         )
@@ -61,6 +66,10 @@ class Container:
     async def aclose(self) -> None:
         await self.llm.aclose()
         await self.github.aclose()
+        try:
+            await self.async_redis.aclose()
+        except Exception:  # noqa: BLE001 - 关闭失败不应影响进程退出
+            logger.warning("async_redis_close_failed", exc_info=True)
 
     def close(self) -> None:
         self.store.close()

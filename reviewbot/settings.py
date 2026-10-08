@@ -19,10 +19,18 @@ class Settings(BaseSettings):
     # ---- 应用 ----
     app_name: str = "code-review-bot"
     env: str = "dev"
-    host: str = "0.0.0.0"
+    # 默认只监听回环地址：这个服务后面挂着**按量计费的 LLM**，
+    # 又没有任何鉴权兜底，默认暴露到 0.0.0.0 等于把付费额度公开。
+    # 确实需要对外提供服务时，显式设置 CRB_HOST=0.0.0.0 并**务必**同时设置 CRB_API_KEY。
+    host: str = "127.0.0.1"
     port: int = 8000
     log_level: str = "INFO"
     log_json: bool = True
+
+    # ---- 鉴权 ----
+    # 为空 = 不启用鉴权（仅适合本机自用）。非空则所有业务端点都要求
+    # 请求头 X-API-Key 与之匹配；健康检查端点始终公开，便于编排系统探活。
+    api_key: str = ""
 
     # ---- Redis ----
     redis_url: str = "redis://localhost:6379/0"
@@ -72,6 +80,15 @@ class Settings(BaseSettings):
     @property
     def llm_configured(self) -> bool:
         return bool(self.llm_api_key)
+
+    @property
+    def auth_enabled(self) -> bool:
+        return bool(self.api_key)
+
+    @property
+    def exposed_without_auth(self) -> bool:
+        """监听非回环地址且未设 API Key —— 危险的组合。"""
+        return self.host not in {"127.0.0.1", "localhost", "::1"} and not self.auth_enabled
 
 
 @lru_cache(maxsize=1)

@@ -1,0 +1,60 @@
+# 本地一键起环境：Redis + API + 可选 Celery worker
+#
+# 用法：
+#   cp .env.example .env        # 填 CRB_LLM_API_KEY
+#   docker compose up --build
+#   curl -s localhost:8000/v1/health | python -m json.tool
+
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "256mb", "--maxmemory-policy", "allkeys-lru"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      CRB_REDIS_URL: redis://redis:6379/0
+      CRB_DB_PATH: /data/reviews.db
+    volumes:
+      - app-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # 默认不启动；需要分布式执行时：docker compose --profile worker up
+  worker:
+    build: .
+    profiles: ["worker"]
+    command: ["celery", "-A", "reviewbot.celery_app:celery_app", "worker", "--loglevel=INFO", "--concurrency=2"]
+    env_file:
+      - .env
+    environment:
+      CRB_REDIS_URL: redis://redis:6379/0
+      CRB_CELERY_BROKER_URL: redis://redis:6379/1
+      CRB_CELERY_RESULT_BACKEND: redis://redis:6379/2
+      CRB_DB_PATH: /data/reviews.db
+    volumes:
+      - app-data:/data
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:
+  app-data:

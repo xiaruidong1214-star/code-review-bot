@@ -1,0 +1,35 @@
+# 依赖自动更新。
+#
+# 为什么要开：本项目依赖 fastapi / httpx / redis / pydantic 等活跃库，
+# 手动跟进既容易漏，也会让版本越拖越旧（越旧越难升）。
+# 这里让 bot 每周提一次 PR，CI 会自动验证——**升级必须过测试**，
+# 所以"自动提 PR"不等于"自动合并"，安全边界仍然在 CI。
+version: 2
+updates:
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    groups:
+      # 把同族依赖合成一个 PR，避免每周被十几个小 PR 淹没
+      runtime:
+        patterns: ["fastapi*", "uvicorn*", "starlette*", "pydantic*"]
+      http-redis:
+        patterns: ["httpx*", "httpcore*", "redis*"]
+      dev-tools:
+        patterns: ["pytest*", "ruff*", "fakeredis*", "pip-audit*"]
+    labels: ["dependencies"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "ci"]
+
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: monthly
+    labels: ["dependencies", "docker"]

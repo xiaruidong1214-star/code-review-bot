@@ -2,8 +2,12 @@ name: CI
 
 on:
   push:
-    branches: ["**"]
+    # 只对主分支与版本标签跑完整 CI：`["**"]` 会让每次临时分支推送都占用
+    # 完整矩阵（含 docker build），在按分钟计费的场景下是纯浪费。
+    branches: [main]
+    tags: ["v*"]
   pull_request:
+  workflow_dispatch:
 
 jobs:
   test:
@@ -29,6 +33,21 @@ jobs:
         # 测试全部使用替身（FakeRedis / httpx.MockTransport），
         # 因此 CI 不需要 Redis 服务，也不会调用任何外部 API
         run: python -m pytest -q
+      - name: 依赖安全审计
+        # 只审计声明依赖，不需要可编辑安装；CVE 会随时间变化，
+        # 因此这一步是"随时间变化的信号"，失败时先看是不是新披露的漏洞。
+        run: |
+          python -m pip install pip-audit
+          python - <<'PY'
+          import pathlib, subprocess, sys, tomllib
+
+          data = tomllib.loads(pathlib.Path("pyproject.toml").read_text(encoding="utf-8"))
+          req = pathlib.Path("audit-requirements.txt")
+          req.write_text("\n".join(data["project"]["dependencies"]), encoding="utf-8")
+          sys.exit(subprocess.run(
+              [sys.executable, "-m", "pip_audit", "-r", str(req), "--progress-spinner", "off"]
+          ).returncode)
+          PY
       - name: CLI 冒烟测试
         run: |
           python -m reviewbot.cli analyze reviewbot/analysis/metrics.py

@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from reviewbot.analysis.metrics import collect_structure, count_lines
+from reviewbot.analysis.metrics import count_lines
 
 
 def _structure(source: str):

@@ -22,7 +22,7 @@ from typing import Any
 
 from reviewbot.analysis import analyze_python, normalize_source
 from reviewbot.cache import CacheStore, build_cache_key
-from reviewbot.github_source import GitHubFetchError, GitHubFetcher
+from reviewbot.github_source import GitHubFetcher, GitHubFetchError
 from reviewbot.llm import LLMClient
 from reviewbot.logging_setup import get_logger
 from reviewbot.store import ReviewStore

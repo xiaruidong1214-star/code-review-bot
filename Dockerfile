@@ -1,5 +1,5 @@
 # ---------- 构建阶段 ----------
-FROM python:3.12-slim AS builder
+FROM python:3.15-slim AS builder
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1
@@ -14,7 +14,7 @@ RUN python -m venv /opt/venv \
  && /opt/venv/bin/pip install ".[worker]"
 
 # ---------- 运行阶段 ----------
-FROM python:3.12-slim AS runtime
+FROM python:3.15-slim AS runtime
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
